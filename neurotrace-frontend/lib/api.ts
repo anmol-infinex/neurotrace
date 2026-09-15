@@ -1,7 +1,7 @@
 import { PredictResult } from "./types";
 
 const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  (process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000").replace(/\/+$/, "");
 
 /**
  * POST /predict — sends the .edf file (and optional annotation) to the backend.
