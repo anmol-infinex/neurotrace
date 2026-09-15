@@ -29,6 +29,13 @@ from datetime import timedelta
 from typing import Optional, List, Tuple, Dict
 
 import numpy as np
+try:
+    import scipy.special
+    if not hasattr(scipy.special, "sph_harm"):
+        # scipy 1.14+ compatibility patch for mne 1.8.0
+        scipy.special.sph_harm = getattr(scipy.special, "sph_harm_y", lambda *args, **kwargs: 0.0)
+except Exception:
+    pass
 import mne
 import matplotlib
 matplotlib.use("Agg")
