@@ -295,19 +295,39 @@ def normalize_window(data: np.ndarray) -> np.ndarray:
 def load_and_window_edf(edf_path: Path):
     """
     Produces X shape (N, SAMPLES_PER_WIN, NUM_CHANNELS) = (N, 1280, 22).
-    All preprocessing exactly matches the training script.
+    Optimized for low-RAM cloud environments (preload=False + selective channel loading + gc).
     """
-    raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose=False)
+    import gc
+
+    raw = mne.io.read_raw_edf(str(edf_path), preload=False, verbose=False)
     raw_fs = float(raw.info["sfreq"])
 
-    # Build monopolar signal dict
-    signals: Dict[str, np.ndarray] = {}
-    for name, data in zip(raw.ch_names, raw.get_data()):
-        clean = clean_channel_name(name)
-        if clean not in signals:
-            signals[clean] = data.astype(np.float32)
+    # Determine needed channel names
+    needed = set()
+    for (first, second) in CHANNEL_PAIRS:
+        needed.add(first)
+        needed.add(second)
+        needed.add(f"{first}-{second}")
+        needed.add(f"{second}-{first}")
 
+    # Load only the relevant EEG channels
+    signals: Dict[str, np.ndarray] = {}
+    for idx, name in enumerate(raw.ch_names):
+        clean = clean_channel_name(name)
+        if clean in needed and clean not in signals:
+            try:
+                ch_data = raw.get_data(picks=[idx])[0].astype(np.float32)
+                signals[clean] = ch_data
+            except Exception as e:
+                logger.warning(f"Could not load channel {name}: {e}")
+
+    # Build 22-channel TCP matrix
     tcp_matrix, availability = build_tcp_channels(signals)
+
+    # Free raw and signals immediately
+    del raw
+    del signals
+    gc.collect()
 
     any_missing = "missing" in availability
     channel_mismatch_warning = None
@@ -330,10 +350,17 @@ def load_and_window_edf(edf_path: Path):
             ),
         )
 
+    # Cap preview signal to 30 seconds max to preserve memory and keep payload snappy
+    preview_len = min(tcp_matrix.shape[1], int(30 * raw_fs))
+    preview_signal = tcp_matrix[:, :preview_len].copy()
+
+    # Cap processing to first 60 windows (10 minutes) for cloud prototype responsiveness
+    max_samples = min(tcp_matrix.shape[1], int(60 * window_samples))
+
     windows = []
     starts_sec = []
 
-    for start in range(0, tcp_matrix.shape[1] - window_samples + 1, window_samples):
+    for start in range(0, max_samples - window_samples + 1, window_samples):
         end = start + window_samples
         t_start = start / raw_fs
         window = tcp_matrix[:, start:end]             # (22, raw_samples)
@@ -343,14 +370,14 @@ def load_and_window_edf(edf_path: Path):
         windows.append(window)
         starts_sec.append(t_start)
 
+    # Free tcp_matrix
+    del tcp_matrix
+    gc.collect()
+
     if not windows:
         raise HTTPException(status_code=400, detail="No valid windows could be extracted.")
 
     X = np.array(windows, dtype=np.float32)           # (N, 1280, 22)
-
-    # Keep raw (non-resampled, non-normalized) signal for preview
-    preview_signal = tcp_matrix  # (22, n_samples_raw)
-
     return X, starts_sec, preview_signal, raw_fs, channel_mismatch_warning
 
 
