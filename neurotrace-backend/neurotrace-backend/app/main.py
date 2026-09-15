@@ -137,6 +137,39 @@ def get_model():
     return _model
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    tb = traceback.format_exc()
+    logger.error(f"Unhandled server error: {tb}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Server internal error: {str(exc)}", "traceback": tb},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+@app.get("/test-model")
+def test_model():
+    import traceback
+    try:
+        model = get_model()
+        dummy_input = np.zeros((1, SAMPLES_PER_WIN, NUM_CHANNELS), dtype=np.float32)
+        preds = model.predict(dummy_input, verbose=0)
+        return {
+            "status": "ok",
+            "input_shape": list(model.input_shape),
+            "output_shape": list(model.output_shape),
+            "dummy_prediction": preds.tolist(),
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e), "traceback": traceback.format_exc()},
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+
 # ============================================================
 # EDF MAGIC-BYTE VALIDATION
 # ============================================================
@@ -590,109 +623,129 @@ async def predict(
     edf_file: UploadFile = File(...),
     annotation_file: Optional[UploadFile] = File(None),
 ):
-    # --- Validation ---
-    if not edf_file.filename.lower().endswith(".edf"):
-        raise HTTPException(status_code=400, detail="Please upload a .edf file.")
+    import traceback
+    try:
+        # --- Validation ---
+        if not edf_file.filename.lower().endswith(".edf"):
+            raise HTTPException(status_code=400, detail="Please upload a .edf file.")
 
-    content = await edf_file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large ({len(content)/1024/1024:.1f} MB). Max: {MAX_UPLOAD_BYTES//1024//1024} MB.",
+        content = await edf_file.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({len(content)/1024/1024:.1f} MB). Max: {MAX_UPLOAD_BYTES//1024//1024} MB.",
+            )
+
+        job_id = str(uuid.uuid4())
+        job_dir = OUTPUT_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        edf_path = job_dir / edf_file.filename
+        with open(edf_path, "wb") as f:
+            f.write(content)
+
+        validate_edf_magic(edf_path)
+
+        # --- EDF → windows ---
+        X, starts_sec, preview_signal, raw_fs, channel_mismatch_warning = (
+            load_and_window_edf(edf_path)
         )
 
-    job_id = str(uuid.uuid4())
-    job_dir = OUTPUT_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+        # --- Inference ---
+        probs = run_inference(X)                         # (N, 3)
+        pred_classes = np.argmax(probs, axis=1).tolist() # [int, ...]
 
-    edf_path = job_dir / edf_file.filename
-    with open(edf_path, "wb") as f:
-        f.write(content)
+        # --- Aggregation ---
+        window_counts = {
+            name: int(np.sum(np.array(pred_classes) == i))
+            for i, name in enumerate(CLASS_NAMES)
+        }
+        avg_probs = {
+            name: float(np.mean(probs[:, i]) * 100)
+            for i, name in enumerate(CLASS_NAMES)
+        }
+        final_prediction = CLASS_NAMES[int(np.argmax(list(avg_probs.values())))]
 
-    validate_edf_magic(edf_path)
+        sustained_events = find_sustained_events(pred_classes, starts_sec)
 
-    # --- EDF → windows ---
-    X, starts_sec, preview_signal, raw_fs, channel_mismatch_warning = (
-        load_and_window_edf(edf_path)
-    )
+        # --- Optional annotation → ROC / confusion ---
+        true_classes = None
+        if annotation_file is not None:
+            ann_path = job_dir / annotation_file.filename
+            ann_content = await annotation_file.read()
+            with open(ann_path, "wb") as f:
+                f.write(ann_content)
+            true_classes = parse_tusz_annotations(ann_path, starts_sec)
 
-    # --- Inference ---
-    probs = run_inference(X)                         # (N, 3)
-    pred_classes = np.argmax(probs, axis=1).tolist() # [int, ...]
+        roc_path, cm_path, cm_text_path = build_roc_and_confusion(
+            probs, pred_classes, true_classes, job_dir
+        )
 
-    # --- Aggregation ---
-    window_counts = {
-        name: int(np.sum(np.array(pred_classes) == i))
-        for i, name in enumerate(CLASS_NAMES)
-    }
-    avg_probs = {
-        name: float(np.mean(probs[:, i]) * 100)
-        for i, name in enumerate(CLASS_NAMES)
-    }
-    final_prediction = CLASS_NAMES[int(np.argmax(list(avg_probs.values())))]
+        # --- Signal preview (downsample to ~50 Hz for the frontend graph) ---
+        step = max(1, int(raw_fs // 50))
+        # Cap preview samples to 5000 max per channel to avoid giant JSON payload
+        preview_clipped = preview_signal[:, ::step]
+        if preview_clipped.shape[1] > 5000:
+            preview_clipped = preview_clipped[:, :5000]
+        preview_clipped = np.nan_to_num(preview_clipped, nan=0.0, posinf=0.0, neginf=0.0)
+        preview_data = preview_clipped.astype(float).tolist()
 
-    sustained_events = find_sustained_events(pred_classes, starts_sec)
+        result = {
+            "job_id": job_id,
+            "final_prediction": final_prediction,
+            "average_probabilities": avg_probs,
+            "window_counts": window_counts,
+            "total_windows": int(len(pred_classes)),
+            "sustained_events": sustained_events,
+            "channels_used": TCP_CHANNELS,
+            "channel_mismatch_warning": channel_mismatch_warning,
+            "window_predictions": [
+                {
+                    "start_sec": float(s),
+                    "class": CLASS_NAMES[c],
+                    "probabilities": [float(p) for p in probs[i]],
+                }
+                for i, (s, c) in enumerate(zip(starts_sec, pred_classes))
+            ],
+            "signal_preview": {
+                "channels": TCP_CHANNELS,
+                "sample_rate_used_for_preview": int(raw_fs // step),
+                "data": preview_data,
+            },
+            "has_ground_truth": true_classes is not None,
+        }
 
-    # --- Optional annotation → ROC / confusion ---
-    true_classes = None
-    if annotation_file is not None:
-        ann_path = job_dir / annotation_file.filename
-        ann_content = await annotation_file.read()
-        with open(ann_path, "wb") as f:
-            f.write(ann_content)
-        true_classes = parse_tusz_annotations(ann_path, starts_sec)
+        report_text = build_text_report(result)
+        (job_dir / "report.txt").write_text(report_text, encoding="utf-8")
+        (job_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
 
-    roc_path, cm_path, cm_text_path = build_roc_and_confusion(
-        probs, pred_classes, true_classes, job_dir
-    )
+        result["report_text"] = report_text
+        result["download_urls"] = {
+            "report_txt":    f"/predict/{job_id}/report",
+            "result_json":   f"/predict/{job_id}/json",
+            "roc_png":       f"/predict/{job_id}/roc.png"       if roc_path    else None,
+            "confusion_png": f"/predict/{job_id}/confusion.png" if cm_path     else None,
+            "confusion_txt": f"/predict/{job_id}/confusion.txt" if cm_text_path else None,
+        }
 
-    # --- Signal preview (downsample to ~50 Hz for the frontend graph) ---
-    step = max(1, int(raw_fs // 50))
-    preview_data = preview_signal[:, ::step].tolist()  # (22, preview_samples)
-
-    result = {
-        "job_id": job_id,
-        "final_prediction": final_prediction,
-        "average_probabilities": avg_probs,
-        "window_counts": window_counts,
-        "total_windows": int(len(pred_classes)),
-        "sustained_events": sustained_events,
-        "channels_used": TCP_CHANNELS,
-        "channel_mismatch_warning": channel_mismatch_warning,
-        "window_predictions": [
-            {
-                "start_sec": s,
-                "class": CLASS_NAMES[c],
-                "probabilities": probs[i].tolist(),
-            }
-            for i, (s, c) in enumerate(zip(starts_sec, pred_classes))
-        ],
-        "signal_preview": {
-            "channels": TCP_CHANNELS,
-            "sample_rate_used_for_preview": int(raw_fs // step),
-            "data": preview_data,
-        },
-        "has_ground_truth": true_classes is not None,
-    }
-
-    report_text = build_text_report(result)
-    (job_dir / "report.txt").write_text(report_text, encoding="utf-8")
-    (job_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-
-    result["report_text"] = report_text
-    result["download_urls"] = {
-        "report_txt":    f"/predict/{job_id}/report",
-        "result_json":   f"/predict/{job_id}/json",
-        "roc_png":       f"/predict/{job_id}/roc.png"       if roc_path    else None,
-        "confusion_png": f"/predict/{job_id}/confusion.png" if cm_path     else None,
-        "confusion_txt": f"/predict/{job_id}/confusion.txt" if cm_text_path else None,
-    }
-
-    logger.info(
-        f"Job {job_id}: {final_prediction}, {len(pred_classes)} windows, "
-        f"{len(sustained_events)} sustained events"
-    )
-    return JSONResponse(result)
+        logger.info(
+            f"Job {job_id}: {final_prediction}, {len(pred_classes)} windows, "
+            f"{len(sustained_events)} sustained events"
+        )
+        return JSONResponse(
+            content=result,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"Inference pipeline failed: {tb}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Inference pipeline failed: {str(e)}", "traceback": tb},
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
 
 
 @app.get("/predict/{job_id}/report")
