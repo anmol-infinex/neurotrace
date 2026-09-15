@@ -1,7 +1,6 @@
 import { PredictResult } from "./types";
 
-const BACKEND_URL =
-  (process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000").replace(/\/+$/, "");
+const BACKEND_URL = "https://neurotrace-4fpu.onrender.com";
 
 /**
  * POST /predict — sends the .edf file (and optional annotation) to the backend.
