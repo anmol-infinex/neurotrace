@@ -1,0 +1,38 @@
+# NeuroTrace Backend — .gitignore
+
+# Model files (may be large — upload separately to Render if > 50MB)
+model/*.keras
+model/*.h5
+model/*.pb
+model/*.tflite
+
+# Job outputs (ephemeral, not for git)
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+*.swp
+
+# Logs
+*.log
