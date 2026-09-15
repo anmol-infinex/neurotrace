@@ -98,6 +98,28 @@ export default function UploadZone({
         />
       </div>
 
+      {/* 1-Click Sample File Option */}
+      <div style={{ textAlign: "center", marginTop: 10, marginBottom: 16 }}>
+        <button
+          type="button"
+          onClick={async (e) => {
+            e.stopPropagation();
+            try {
+              const res = await fetch("/sample.edf");
+              const blob = await res.blob();
+              const file = new File([blob], "tusz_verified_sample.edf", { type: "application/octet-stream" });
+              onEdfFile(file);
+            } catch (err) {
+              console.error("Failed to load sample:", err);
+            }
+          }}
+          className="btn btn-ghost"
+          style={{ fontSize: 13, color: "#38bdf8", cursor: "pointer" }}
+        >
+          ✨ Try with pre-loaded Sample EEG File (1-Click)
+        </button>
+      </div>
+
       {/* Annotation file (optional) */}
       <div className="annotation-row">
         <span>🏷️</span>
